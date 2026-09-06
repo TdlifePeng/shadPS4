@@ -267,6 +267,7 @@ public:
         auto& image = image_resources[index];
         image.is_atomic |= desc.is_atomic;
         image.is_written |= desc.is_written;
+        image.is_srt_offset |= desc.is_srt_offset;
         return index;
     }
 
@@ -418,6 +419,42 @@ SharpSources FindSharpSources(const IR::Inst* handle, u32 pc) {
     return sources;
 }
 
+// Returns whether an image instruction's T# is loaded via the "SRT root + s_add immediate offset"
+// pattern (SH probe slot, may be invalid). Criterion: the sharp source is a ReadConst whose base
+// composite's low 32 bits are IAdd32(GetUserData, non-zero Imm) — the single-level shape produced
+// by s_add_u32 s4, s0, <imm>.
+//
+// NOTE: matches only this known single-level pattern (experimental). A complete solution would
+// track the immediate's constant expression at translation time instead of pattern-matching the
+// IR shape afterwards.
+static bool IsSrtOffsetSharp(const IR::Inst* handle, u32 pc) {
+    auto sources = FindSharpSources(handle, pc);
+    for (const IR::Inst* source : sources) {
+        if (source->GetOpcode() != IR::Opcode::ReadConst) {
+            continue;
+        }
+        const IR::Inst* composite = source->Arg(0).InstRecursive();
+        if (composite->GetOpcode() != IR::Opcode::CompositeConstructU32x2) {
+            continue;
+        }
+        const IR::Inst* lo = composite->Arg(0).InstRecursive();
+        if (!lo || lo->GetOpcode() != IR::Opcode::IAdd32) {
+            continue;
+        }
+        const bool imm0 = lo->Arg(0).IsImmediate();
+        const bool imm1 = lo->Arg(1).IsImmediate();
+        if (imm0 == imm1) {
+            continue;
+        }
+        const IR::Inst* base = (imm0 ? lo->Arg(1) : lo->Arg(0)).InstRecursive();
+        const u32 byte_offset = imm0 ? lo->Arg(0).U32() : lo->Arg(1).U32();
+        if (byte_offset != 0 && base && base->GetOpcode() == IR::Opcode::GetUserData) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool IsCfgBlockDominatedBy(const Shader::Gcn::Block* maybe_dominator,
                            const Shader::Gcn::Block* block, const Shader::Gcn::Block* dest_block) {
     if (block == maybe_dominator) {
@@ -556,6 +593,10 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& 
     const auto inst_info = inst.Flags<IR::TextureInstInfo>();
     const IR::Inst* image_handle = inst.Arg(0).InstRecursive();
     const auto tsharp = TrackSharp(image_handle, block, inst_info.pc);
+    const bool is_srt_offset = IsSrtOffsetSharp(image_handle, inst_info.pc);
+    if (is_srt_offset) {
+        info.has_srt_offset = true;
+    }
     const bool is_atomic = IsImageAtomicInstruction(inst);
     const bool is_written = inst.GetOpcode() == IR::Opcode::ImageWrite || is_atomic;
     const bool is_storage =
@@ -571,6 +612,7 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& 
         .is_array = bool(inst_info.is_array),
         .is_written = is_written,
         .is_r128 = bool(inst_info.is_r128),
+        .is_srt_offset = is_srt_offset,
     };
 
     auto image = image_res.GetSharp(info);

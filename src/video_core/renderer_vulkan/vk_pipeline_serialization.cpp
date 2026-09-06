@@ -418,6 +418,15 @@ bool Info::Deserialize(Serialization::Archive& ar) {
     info.Read(this, sizeof(Shader::InfoPersistent));
     info.Read(flattened_ud_buf);
 
+    // is_srt_offset is serialized as part of ImageResource; recompute the derived flag.
+    has_srt_offset = false;
+    for (const auto& image : images) {
+        if (image.is_srt_offset) {
+            has_srt_offset = true;
+            break;
+        }
+    }
+
     return srt_info.Deserialize(ar);
 }
 

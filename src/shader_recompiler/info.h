@@ -129,6 +129,7 @@ struct Info : InfoPersistent {
 
     VAddr pgm_base;
     bool has_storage_images{};
+    bool has_srt_offset{};
     bool has_discard{};
     bool has_image_gather{};
     bool has_image_query{};
@@ -194,6 +195,21 @@ struct Info : InfoPersistent {
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
         if (srt_info.walker_func) {
             srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
+        }
+        if (has_srt_offset) {
+            PostRefreshFlatBuf();
+        }
+    }
+
+    // Clears is_srt_offset T#s in the freshly-filled flatbuf. Step 1 clears all of them
+    // unconditionally; step 2 will refine this to only clear invalid ones.
+    void PostRefreshFlatBuf() {
+        for (const auto& image : images) {
+            if (!image.is_srt_offset) {
+                continue;
+            }
+            auto& sharp = *reinterpret_cast<AmdGpu::Image*>(&flattened_ud_buf[image.sharp_idx]);
+            sharp = AmdGpu::Image::Null(image.is_depth);
         }
     }
 

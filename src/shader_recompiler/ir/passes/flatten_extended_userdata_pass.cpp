@@ -243,6 +243,56 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     info.srt_info.flattened_bufsize_dw = pass_info.dst_off_dw;
 }
 
+// Extract "GetUserData root + IAdd32 immediate offset (bytes)" from the single-level shape that
+// s_add_u32 s4, s0, <imm> produces: IAdd32(GetUserData, Imm). Deeper or non-matching shapes return
+// {nullptr, 0} and the caller falls back to BFS.
+//
+// NOTE: matches only this known single-level pattern (experimental). A complete solution would
+// track the immediate's constant expression at translation time instead of pattern-matching the
+// IR shape afterwards.
+std::pair<IR::Inst*, u32> TraceUserDataBase(IR::Inst* inst) {
+    if (!inst || inst->GetOpcode() != IR::Opcode::IAdd32) {
+        return {nullptr, 0};
+    }
+    const bool imm0 = inst->Arg(0).IsImmediate();
+    const bool imm1 = inst->Arg(1).IsImmediate();
+    if (imm0 == imm1) {
+        return {nullptr, 0}; // both immediate or both non-immediate -> cannot resolve statically
+    }
+    IR::Inst* base = (imm0 ? inst->Arg(1) : inst->Arg(0)).InstRecursive();
+    if (!base || base->GetOpcode() != IR::Opcode::GetUserData) {
+        return {nullptr, 0};
+    }
+    return {base, imm0 ? inst->Arg(0).U32() : inst->Arg(1).U32()};
+}
+
+// Check whether the high-32 IAdd32 chain carries a non-zero immediate offset (s_addc_u32 s5, s1,
+// <imm>, imm != 0). The high 32 bits are typically IAdd32(IAdd32(GetUserData, imm), carry), i.e.
+// exactly one level of IAdd32 nesting; only immediate operands are inspected, so the carry's
+// Select(GetScc(),...) is never misread as an offset.
+bool HasNonZeroImmediateOffset(IR::Inst* inst) {
+    if (!inst || inst->GetOpcode() != IR::Opcode::IAdd32) {
+        return false;
+    }
+    for (size_t i = 0; i < inst->NumArgs(); i++) {
+        const IR::Value arg = inst->Arg(i);
+        if (arg.IsImmediate()) {
+            if (arg.U32() != 0) {
+                return true;
+            }
+        } else if (IR::Inst* sub = arg.InstRecursive();
+                   sub && sub->GetOpcode() == IR::Opcode::IAdd32) {
+            for (size_t j = 0; j < sub->NumArgs(); j++) {
+                const IR::Value a = sub->Arg(j);
+                if (a.IsImmediate() && a.U32() != 0) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 }; // namespace
 
 void FlattenExtendedUserdataPass(IR::Program& program) {
@@ -278,18 +328,58 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
                     }
                     return std::nullopt;
                 };
-                auto base0 = IR::BreadthFirstSearch(ptr_composite->Arg(0), pred);
-                auto base1 = IR::BreadthFirstSearch(ptr_composite->Arg(1), pred);
-                ASSERT_MSG(base0 && base1, "ReadConst not from constant memory");
 
-                IR::Inst* ptr_lo = base0.value();
+                // Recognize "address = consecutive-SGPR GetUserData root + immediate offset":
+                //   low 32 -> GetUserData(N), high 32 -> GetUserData(N+1), N/N+1 consecutive.
+                // Only accumulate the offset for this shape (the s_add_u32 s4, s0, <imm> immediate);
+                // otherwise fall back to the original BFS with offset 0 (avoid corrupting
+                // multi-level pointers / dynamic indexing / non-consecutive SGPRs).
+                auto [lo_base, lo_byte_offset] =
+                    TraceUserDataBase(ptr_composite->Arg(0).InstRecursive());
+                auto hi_base = IR::BreadthFirstSearch(ptr_composite->Arg(1), pred);
+
+                IR::Inst* ptr_lo = nullptr;
+                u32 byte_offset = 0;
+                if (lo_base && hi_base && lo_base->GetOpcode() == IR::Opcode::GetUserData &&
+                    hi_base.value()->GetOpcode() == IR::Opcode::GetUserData &&
+                    static_cast<u32>(lo_base->Arg(0).ScalarReg()) + 1 ==
+                        static_cast<u32>(hi_base.value()->Arg(0).ScalarReg())) {
+                    // Consecutive SGPR root: the low-32 offset is the address byte offset.
+                    // A non-zero high-32 immediate offset (s_addc_u32 s5, s1, <imm>, imm != 0) is
+                    // statically detectable, so warn instead of silently dropping it. Carry overflow
+                    // (Select(GetScc(),1,0)) cannot be accumulated statically; treat it as 0 (the
+                    // carry window is only 272 bytes, effectively always 0).
+                    if (HasNonZeroImmediateOffset(ptr_composite->Arg(1).InstRecursive())) {
+                        LOG_ERROR(Render_Recompiler,
+                                  "SRT flatten: high 32-bit pointer has non-zero immediate "
+                                  "offset, dropped by 32-bit offset tracing");
+                    }
+                    ptr_lo = lo_base;
+                    byte_offset = lo_byte_offset;
+                } else {
+                    // Fall back to the original BFS behavior
+                    auto base0 = IR::BreadthFirstSearch(ptr_composite->Arg(0), pred);
+                    auto base1 = IR::BreadthFirstSearch(ptr_composite->Arg(1), pred);
+                    ASSERT_MSG(base0 && base1, "ReadConst not from constant memory");
+                    ptr_lo = base0.value();
+                    byte_offset = 0;
+                }
+
                 ptr_lo = pass_info.DeduplicateInstruction(ptr_lo);
 
                 auto ptr_uses_kv =
                     pass_info.pointer_uses.try_emplace(ptr_lo, PassInfo::PtrUserList{});
                 PassInfo::PtrUserList& user_list = ptr_uses_kv.first->second;
 
-                user_list[inst.Arg(1).U32()].push_back(&inst);
+                // Byte offset -> dwords, added to the ReadConst offset (SMRD offset field is in dwords)
+                if (byte_offset & 3) {
+                    LOG_ERROR(Render_Recompiler,
+                              "SRT flatten: pointer byte offset {:#x} not dword-aligned, low 2 "
+                              "bits dropped",
+                              byte_offset);
+                }
+                const u32 src_off_dw = inst.Arg(1).U32() + (byte_offset >> 2);
+                user_list[src_off_dw].push_back(&inst);
 
                 if (ptr_lo->GetOpcode() == IR::Opcode::GetUserData) {
                     IR::ScalarReg ud_reg = ptr_lo->Arg(0).ScalarReg();
