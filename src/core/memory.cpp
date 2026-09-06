@@ -994,6 +994,20 @@ s32 MemoryManager::UnmapMemoryImpl(VAddr virtual_addr, u64 size) {
     return ORBIS_OK;
 }
 
+bool MemoryManager::IsAddressMapped(VAddr addr) {
+    // PS4 guest addresses are below 16 GB; anything above is never a valid mapping.
+    if (addr >= 0x400000000ULL) {
+        return false;
+    }
+    std::shared_lock lk{mutex};
+    if (vma_map.empty() || addr < vma_map.begin()->first) {
+        return false;
+    }
+    auto it = FindVMA(addr);
+    return it != vma_map.end() && it->second.IsMapped() &&
+           addr < it->second.base + it->second.size;
+}
+
 s32 MemoryManager::QueryProtection(VAddr addr, void** start, void** end, u32* prot) {
     std::shared_lock lk{mutex};
     VAddr min_query_addr = impl.SystemManagedVirtualBase();

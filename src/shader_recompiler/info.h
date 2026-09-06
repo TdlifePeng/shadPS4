@@ -201,17 +201,10 @@ struct Info : InfoPersistent {
         }
     }
 
-    // Clears is_srt_offset T#s in the freshly-filled flatbuf. Step 1 clears all of them
-    // unconditionally; step 2 will refine this to only clear invalid ones.
-    void PostRefreshFlatBuf() {
-        for (const auto& image : images) {
-            if (!image.is_srt_offset) {
-                continue;
-            }
-            auto& sharp = *reinterpret_cast<AmdGpu::Image*>(&flattened_ud_buf[image.sharp_idx]);
-            sharp = AmdGpu::Image::Null(image.is_depth);
-        }
-    }
+    // Clears is_srt_offset T#s in the freshly-filled flatbuf whose base address is not a valid
+    // guest mapping, so garbage probe slots never reach texture cache nor vary the pipeline
+    // specialization. Implemented in info.cpp.
+    void PostRefreshFlatBuf();
 
     void ReadTessConstantBuffer(TessellationDataConstantBuffer& tess_constants) const {
         ASSERT(tess_consts_dword_offset >= 0); // We've already tracked the V# UD

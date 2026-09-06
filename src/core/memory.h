@@ -234,6 +234,10 @@ public:
         return size_to_validate <= 0;
     }
 
+    // Returns whether addr falls inside a valid (non-free) guest mapping. Rejects addresses
+    // outside the PS4 guest range upfront, then does a thread-safe VMA lookup.
+    bool IsAddressMapped(VAddr addr);
+
     u64 ClampRangeSize(VAddr virtual_addr, u64 size);
 
     void SetPrtArea(u32 id, VAddr address, u64 size);
